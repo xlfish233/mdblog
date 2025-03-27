@@ -1,0 +1,9 @@
+[book]
+authors = ["xlfish233"]
+language = "en"
+multilingual = false
+src = "src"
+title = "xlfish233's blog"
+
+[output.html]
+output = "book"
