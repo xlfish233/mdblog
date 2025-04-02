@@ -1,1 +1,5 @@
 book
+.env
+node_modules
+bun.lock
+hash.bin
