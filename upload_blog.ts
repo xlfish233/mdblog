@@ -1,10 +1,9 @@
 #!/usr/bin/env bun
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
-import { readdir, stat, readFile, writeFile } from "fs/promises";
+import { readdir, stat, readFile, writeFile, } from "fs/promises";
+import { createReadStream } from 'fs';
 import { join, relative, extname } from "path";
 import { createHash } from "crypto";
-
-
 
 interface Config {
   endpoint: string;
@@ -14,23 +13,25 @@ interface Config {
   };
   region: string;
 }
+
+const MIME_TYPES: Map<string, string> = new Map([
+  ['.html', 'text/html'],
+  ['.css', 'text/css'],
+  ['.js', 'application/javascript'],
+  ['.json', 'application/json'],
+  ['.png', 'image/png'],
+  ['.svg', 'image/svg+xml'],
+  ['.jpg', 'image/jpeg'],
+  ['.jpeg', 'image/jpeg'],
+  ['.woff', 'font/woff'],
+  ['.woff2', 'font/woff2'],
+  ['.ttf', 'font/ttf'],
+  ['.eot', 'application/vnd.ms-fontobject'],
+]);
+
 function getContentType(filename: string): string {
-  return MIME_TYPES[extname(filename).toLowerCase()] || 'application/octet-stream';
+  return MIME_TYPES.get(extname(filename).toLowerCase()) || 'application/octet-stream';
 }
-const MIME_TYPES: Record<string, string> = {
-  '.html': 'text/html',
-  '.css': 'text/css',
-  '.js': 'application/javascript',
-  '.json': 'application/json',
-  '.png': 'image/png',
-  '.svg': 'image/svg+xml',
-  '.jpg': 'image/jpeg',
-  '.jpeg': 'image/jpeg',
-  '.woff': 'font/woff',
-  '.woff2': 'font/woff2',
-  '.ttf': 'font/ttf',
-  '.eot': 'application/vnd.ms-fontobject',
-};
 
 const config: Config = {
   endpoint: `https://${process.env.CF_ACCOUNT_ID}.r2.cloudflarestorage.com`,
@@ -43,78 +44,126 @@ const config: Config = {
 
 const client = new S3Client(config);
 const BUCKET_NAME = process.env.CF_BUCKET_NAME || '';
-
-let file_hashes: Set<string> = new Set<string>();
+const UPLOAD_DIRECTORY = process.env.UPLOAD_DIRECTORY || './book';
+let file_hashes: string[] = [];
 
 async function getFileHash(filePath: string): Promise<string> {
-  const content = await Bun.file(filePath).arrayBuffer();
-  return createHash('sha256').update(Buffer.from(content)).digest('hex');
+  console.log(`Calculating hash for ${filePath}`);
+  try {
+    const content = await Bun.file(filePath).arrayBuffer();
+    return createHash('sha256').update(Buffer.from(content)).digest('hex');
+  } catch (error: any) {
+    console.error(`Failed to calculate hash for ${filePath}: ${error.message}`);
+    throw error;
+  }
 }
 
 async function isHashExists(hash: string): Promise<boolean> {
-  return file_hashes?.has(hash) || false;
+  return file_hashes.includes(hash);
 }
 
 async function recordHash(hash: string): Promise<void> {
-  file_hashes.add(hash);
+  file_hashes.push(hash);
 }
 
 async function saveHash(): Promise<void> {
   console.log('Saving hash.bin...');
-  const hash_binFile_path = join(process.cwd(), 'hash.bin');
-  await writeFile(hash_binFile_path, [...file_hashes].join('\n'));
-  console.log('hash.bin saved successfully!');
+  try {
+    const hash_binFile_path = join(process.cwd(), 'hash.bin');
+    await writeFile(hash_binFile_path, file_hashes.join('\n'));
+    console.log('hash.bin saved successfully!');
+  } catch (error: any) {
+    console.error(`Failed to save hash.bin: ${error.message}`);
+    throw error;
+  }
 }
 
 async function loadHash(): Promise<void> {
   console.log('Initializing hash.bin...');
-  const hash_binFile_path = join(process.cwd(), 'hash.bin');
-  const hashes = await readFile(hash_binFile_path, 'utf-8');
-  file_hashes = new Set<string>(hashes.split('\n'));
+  try {
+    const hash_binFile_path = join(process.cwd(), 'hash.bin');
+    const hashes = await readFile(hash_binFile_path, 'utf-8');
+    file_hashes = hashes.split('\n');
+  } catch (error: any) {
+    file_hashes = [];
+    console.error('Failed to read hash.bin:', error);
+  }
 }
 
-
-
-
 async function uploadFile(bucket: string, filePath: string, key: string): Promise<void> {
-  const hash = await getFileHash(filePath);
+  console.log(`Uploading ${key} to bucket ${bucket}`);
+  try {
+    const hash = await getFileHash(filePath);
 
-  if (await isHashExists(hash)) {
-    console.log(`Skipping ${key} (already uploaded)`);
-    return;
+    if (await isHashExists(hash)) {
+      console.log(`Skipping ${key} (already uploaded)`);
+      return;
+    }
+
+    const fileStream = createReadStream(filePath);
+    const command = new PutObjectCommand({
+      Bucket: bucket,
+      Key: key,
+      Body: fileStream,
+      ContentType: getContentType(key)
+    });
+
+    const retryOperation = require('retry').operation({
+      retries: 3,
+      factor: 2,
+      minTimeout: 1000,
+      maxTimeout: 2000
+    });
+
+    await new Promise((resolve, reject) => {
+      retryOperation.attempt(async (currentAttempt) => {
+        console.log(`Attempt ${currentAttempt} to upload ${key}`);
+        try {
+          await client.send(command);
+          resolve(undefined);
+        } catch (err: any) {
+          console.error(`Error uploading ${key} (attempt ${currentAttempt}):`, err);
+          if (retryOperation.retry(err)) {
+            return;
+          }
+          reject(retryOperation.mainError());
+        }
+      });
+    });
+    await recordHash(hash);
+    console.log(`Uploaded ${key} and recorded hash`);
+  } catch (error: any) {
+    console.error(`Failed to upload ${key}: ${error.message}`);
+    throw error;
   }
-
-  const fileContent = await Bun.file(filePath).arrayBuffer();
-  const command = new PutObjectCommand({
-    Bucket: bucket,
-    Key: key,
-    Body: new Uint8Array(fileContent),
-    ContentType: getContentType(key)
-  });
-
-  await client.send(command);
-  await recordHash(hash);
-  console.log(`Uploaded ${key} and recorded hash`);
 }
 
 async function uploadDirectory(bucket: string, dirPath: string): Promise<void> {
   console.log(`Uploading ${dirPath}...`);
-  const files = await readdir(dirPath);
+  try {
+    const files = await readdir(dirPath);
 
-  await Promise.all(files.map(async (file) => {
-    const fullPath = join(dirPath, file);
-    const stats = await stat(fullPath);
+    const uploadPromises: Promise<void>[] = [];
 
-    if (stats.isDirectory()) {
-      await uploadDirectory(bucket, fullPath);
-    } else {
-      const relativePath = relative(process.cwd(), fullPath);
-      console.log(`Uploading ${relativePath}...`);
-      await uploadFile(bucket, fullPath, relativePath);
+    for (const file of files) {
+      const fullPath = join(dirPath, file);
+      const stats = await stat(fullPath);
+
+      if (stats.isDirectory()) {
+        uploadPromises.push(uploadDirectory(bucket, fullPath));
+      } else {
+        const relativePath = relative(process.cwd(), fullPath);
+        console.log(`Uploading ${relativePath}...`);
+        uploadPromises.push(uploadFile(bucket, fullPath, relativePath));
+      }
     }
-  }));
-}
 
+    await Promise.all(uploadPromises);
+  } catch (error: any) {
+    console.error(`Failed to upload directory ${dirPath}: ${error.message}`);
+    throw error;
+  }
+}
 
 async function main(): Promise<void> {
   if (!BUCKET_NAME) {
@@ -129,7 +178,7 @@ async function main(): Promise<void> {
   }
 
   try {
-    await uploadDirectory(BUCKET_NAME, './book');
+    await uploadDirectory(BUCKET_NAME, UPLOAD_DIRECTORY);
     console.log('Upload completed successfully!');
     await saveHash();
   } catch (error) {
