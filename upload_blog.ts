@@ -1,7 +1,6 @@
 #!/usr/bin/env bun
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { readdir, stat, readFile, writeFile, } from "fs/promises";
-import { createReadStream } from 'fs';
 import { join, relative, extname } from "path";
 import { createHash } from "crypto";
 
@@ -47,17 +46,6 @@ const BUCKET_NAME = process.env.CF_BUCKET_NAME || '';
 const UPLOAD_DIRECTORY = process.env.UPLOAD_DIRECTORY || './book';
 let file_hashes: string[] = [];
 
-async function getFileHash(filePath: string): Promise<string> {
-  console.log(`Calculating hash for ${filePath}`);
-  try {
-    const content = await Bun.file(filePath).arrayBuffer();
-    return createHash('sha256').update(Buffer.from(content)).digest('hex');
-  } catch (error: any) {
-    console.error(`Failed to calculate hash for ${filePath}: ${error.message}`);
-    throw error;
-  }
-}
-
 async function isHashExists(hash: string): Promise<boolean> {
   return file_hashes.includes(hash);
 }
@@ -93,43 +81,58 @@ async function loadHash(): Promise<void> {
 async function uploadFile(bucket: string, filePath: string, key: string): Promise<void> {
   console.log(`Uploading ${key} to bucket ${bucket}`);
   try {
-    const hash = await getFileHash(filePath);
+    // Read file content into a buffer
+    const fileBuffer = await readFile(filePath);
+
+    // Check size from buffer length
+    if (fileBuffer.length === 0) {
+      console.log(`Skipping ${key} (0 bytes)`);
+      return;
+    }
+
+    // Calculate hash from the buffer
+    console.log(`Calculating hash for ${key}`);
+    const hash = createHash('sha256').update(fileBuffer).digest('hex');
 
     if (await isHashExists(hash)) {
       console.log(`Skipping ${key} (already uploaded)`);
       return;
     }
 
-    const fileStream = createReadStream(filePath);
-    const command = new PutObjectCommand({
-      Bucket: bucket,
-      Key: key,
-      Body: fileStream,
-      ContentType: getContentType(key)
-    });
+    const MAX_RETRIES = 3;
+    const INITIAL_DELAY_MS = 1000;
 
-    const retryOperation = require('retry').operation({
-      retries: 3,
-      factor: 2,
-      minTimeout: 1000,
-      maxTimeout: 2000
-    });
-
-    await new Promise((resolve, reject) => {
-      retryOperation.attempt(async (currentAttempt) => {
-        console.log(`Attempt ${currentAttempt} to upload ${key}`);
-        try {
-          await client.send(command);
-          resolve(undefined);
-        } catch (err: any) {
-          console.error(`Error uploading ${key} (attempt ${currentAttempt}):`, err);
-          if (retryOperation.retry(err)) {
-            return;
-          }
-          reject(retryOperation.mainError());
-        }
+    let lastError: any = null;
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      console.log(`Attempt ${attempt} to upload ${key}`);
+      // Create command with the buffer for each attempt
+      const command = new PutObjectCommand({
+        Bucket: bucket,
+        Key: key,
+        Body: fileBuffer, // Use the buffer directly
+        ContentType: getContentType(key)
       });
-    });
+
+      try {
+        await client.send(command);
+        // If successful, break the loop
+        lastError = null; // Clear last error on success
+        break;
+      } catch (err: any) {
+        lastError = err;
+        console.error(`Error uploading ${key} (attempt ${attempt}):`, err);
+        if (attempt < MAX_RETRIES) {
+          const delay = INITIAL_DELAY_MS * Math.pow(2, attempt - 1);
+          console.log(`Retrying in ${delay}ms...`);
+          await new Promise(resolve => setTimeout(resolve, delay));
+        }
+      }
+    }
+
+    // If all retries failed, throw the last encountered error
+    if (lastError) {
+      throw lastError;
+    }
     await recordHash(hash);
     console.log(`Uploaded ${key} and recorded hash`);
   } catch (error: any) {
